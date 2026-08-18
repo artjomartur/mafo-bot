@@ -1,4 +1,5 @@
 const { chromium } = require('playwright');
+const OpenAI = require('openai');
 require('dotenv').config();
 
 (async () => {
@@ -75,9 +76,82 @@ require('dotenv').config();
         
         console.log('Aktuelle URL nach Klick auf Bewerben:', page.url());
         
-        // Pause here so we can inspect the page in headful mode
-        console.log('Pausiere Skript, um die Seite zu inspizieren. (Im echten Lauf würden wir hier das Formular abschicken)');
-        await page.pause(); 
+        console.log('Extrahiere Formular-Fragen für die KI...');
+        const formHtml = await page.evaluate(() => {
+            const form = document.querySelector('form') || document.body;
+            const clone = form.cloneNode(true);
+            clone.querySelectorAll('script, style, input[type="hidden"], svg').forEach(el => el.remove());
+            return clone.innerHTML;
+        });
+
+        const apiKey = process.env.OPENAI_API_KEY;
+        const userProfile = process.env.USER_PROFILE;
+
+        if (!apiKey || apiKey.includes('dein_openai_api_key') || !userProfile) {
+            console.log('KI-Antworten übersprungen: OPENAI_API_KEY oder USER_PROFILE fehlen in der .env oder sind Standardwerte.');
+            await page.pause();
+        } else {
+            console.log('Frage KI nach den richtigen Antworten (dies dauert einen Moment)...');
+            const openai = new OpenAI({ apiKey });
+            
+            const prompt = `
+Du bist ein Assistent, der Webformulare ausfüllt.
+Hier ist das Profil des Nutzers:
+"""
+${userProfile}
+"""
+
+Hier ist das HTML des Formulars (Zusatzfragen für eine Marktforschungsstudie):
+"""
+${formHtml}
+"""
+
+Aufgabe:
+Analysiere die Fragen im HTML (Checkboxen, Radio-Buttons) und vergleiche sie mit dem Nutzerprofil.
+Finde die exakten CSS-Selektoren (z.B. "#id" oder "input[name='xyz'][value='123']") für alle Optionen, die angeklickt werden müssen, damit das Formular wahrheitsgemäß beantwortet wird.
+Vergiss nicht, auch die Datenschutz-Checkbox ("Ich bin damit einverstanden...") in die Liste aufzunehmen, da diese Pflicht ist.
+
+Gib ein striktes JSON-Objekt mit einem einzigen Key "selectors" zurück, der ein Array von Strings (die CSS-Selektoren) enthält.
+Beispiel: { "selectors": ["#checkbox1", "input[name='q1'][value='yes']"] }
+`;
+
+            try {
+                const completion = await openai.chat.completions.create({
+                    messages: [{ role: "user", content: prompt }],
+                    model: "gpt-4o",
+                    response_format: { type: "json_object" }
+                });
+
+                const responseText = completion.choices[0].message.content;
+                const result = JSON.parse(responseText);
+                const selectors = result.selectors || [];
+                
+                console.log('Die KI empfiehlt folgende Klicks:', selectors);
+
+                for (const selector of selectors) {
+                    console.log(`Klicke auf: ${selector}`);
+                    await page.click(selector, { force: true });
+                    await page.waitForTimeout(500); // kleine Pause zwischen Klicks, damit es menschlicher wirkt
+                }
+
+                console.log('Klicks ausgeführt! Formular ist bereit zum Absenden.');
+                
+                const finalSubmit = await page.$('input[type="submit"][value="Bewerben"], button:has-text("Bewerben")');
+                if (finalSubmit) {
+                    console.log('Sende Formular final ab... (Der finale Klick ist noch auskommentiert für deinen Test)');
+                    // await finalSubmit.click(); 
+                    // await page.waitForLoadState('networkidle');
+                    // console.log('Bewerbung erfolgreich abgeschickt!');
+                }
+
+                console.log('Pausiere zur manuellen Kontrolle. Du kannst dir das Ergebnis im Browser ansehen.');
+                await page.pause();
+
+            } catch (err) {
+                console.error('Fehler bei der KI-Anfrage oder beim Klicken:', err);
+                await page.pause();
+            }
+        }
     }
 
   } catch (error) {
