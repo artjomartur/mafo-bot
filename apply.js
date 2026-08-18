@@ -87,27 +87,27 @@ function saveProcessedStudy(id) {
         await page.waitForTimeout(200); // short wait for animation
     }
 
-    // Evaluate all forms and their action targets
-    const studyLinks = await page.evaluate(() => {
-        const links = [];
-        document.querySelectorAll('form').forEach(f => {
-            const btn = f.querySelector('input[value="Bewerben"], button[type="submit"]');
-            if (btn && f.getAttribute('action')) {
-                // Ensure it's a study link
-                if (f.getAttribute('action').includes('einzelne_Studie')) {
-                    links.push(f.getAttribute('action'));
-                }
+    // Evaluate all forms and get a handle to them
+    const forms = await page.$$('form');
+    
+    // We will collect the valid forms that have a Bewerben button
+    const studyForms = [];
+    for (const f of forms) {
+        const action = await f.getAttribute('action');
+        if (action && action.includes('einzelne_Studie')) {
+            const btn = await f.$('input[value="Bewerben"], button[type="submit"]');
+            if (btn) {
+                studyForms.push({ form: f, btn: btn, action: action });
             }
-        });
-        return Array.from(new Set(links)); // Unique links only
-    });
+        }
+    }
 
-    console.log(`Gefundene Studien-Links: ${studyLinks.length}`);
+    console.log(`Gefundene Studien-Formulare: ${studyForms.length}`);
     const processedStudies = getProcessedStudies();
 
-    for (const link of studyLinks) {
-        const studyIdMatch = link.match(/\?(\d+)/);
-        const studyId = studyIdMatch ? studyIdMatch[1] : link;
+    for (const { form, btn, action } of studyForms) {
+        const studyIdMatch = action.match(/\?(\d+)/);
+        const studyId = studyIdMatch ? studyIdMatch[1] : action;
 
         if (processedStudies.includes(studyId)) {
             console.log(`Studie ${studyId} wurde bereits bearbeitet. Überspringe...`);
@@ -117,21 +117,84 @@ function saveProcessedStudy(id) {
         console.log(`\n============================`);
         console.log(`Öffne Studie ${studyId} in neuem Tab...`);
         
-        const studyUrl = link.startsWith('http') 
-            ? link 
-            : 'https://www.mafo-service-schmidt.de/' + (link.startsWith('/') ? link.substring(1) : link);
-            
-        const newPage = await context.newPage();
-        await newPage.goto(studyUrl);
+        // Set form target to _blank so it opens in a new tab when submitted
+        await form.evaluate(f => f.setAttribute('target', '_blank'));
+        
+        // Click the button natively via JS to bypass visibility checks
+        const [newPage] = await Promise.all([
+            context.waitForEvent('page'),
+            btn.evaluate(b => b.click())
+        ]);
+        
+        console.log('Warte auf das Laden des neuen Tabs...');
+        // Wir müssen explizit warten, bis der neue Tab nicht mehr leer (about:blank) ist
+        try {
+            await newPage.waitForURL('**/einzelne_Studie*', { timeout: 15000 });
+        } catch (e) {
+            console.log('Warnung: URL hat sich nicht zu "einzelne_Studie" geändert, fahre trotzdem fort...');
+        }
+        
         await newPage.waitForLoadState('networkidle');
-
-        console.log('Extrahiere Formular-Fragen für die KI...');
-        const formHtml = await newPage.evaluate(() => {
-            const form = document.querySelector('form') || document.body;
-            const clone = form.cloneNode(true);
-            clone.querySelectorAll('script, style, input[type="hidden"], svg').forEach(el => el.remove());
-            return clone.innerHTML;
+        await newPage.waitForTimeout(2000); // Gib der Seite etwas extra Zeit zum Re        console.log('Extrahiere Formular-Fragen für die KI...');
+        const simplifiedForm = await newPage.evaluate(() => {
+            const inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"], input[type="text"], input[type="number"], textarea, select');
+            let result = '';
+            inputs.forEach(input => {
+                let labelText = '';
+                // 1. Suche nach label[for=id]
+                if (input.id) {
+                    const label = document.querySelector(`label[for="${input.id}"]`);
+                    if (label) labelText = label.innerText;
+                }
+                // 2. Suche nach Parent-Label
+                if (!labelText) {
+                    const parentLabel = input.closest('label');
+                    if (parentLabel) labelText = parentLabel.innerText;
+                }
+                // 3. Fallback auf Parent-Text
+                if (!labelText && input.parentElement) {
+                    labelText = input.parentElement.innerText;
+                }
+                
+                // Bereinige den Text
+                labelText = labelText.replace(/\s+/g, ' ').trim().substring(0, 150);
+                
+                const type = input.tagName.toLowerCase() === 'textarea' ? 'textarea' : (input.tagName.toLowerCase() === 'select' ? 'select' : input.type);
+                const name = input.name || '';
+                const val = input.value || '';
+                const id = input.id || '';
+                
+                let extraInfo = '';
+                if (type === 'select') {
+                    const opts = Array.from(input.options).map(o => o.text).join(', ');
+                    extraInfo = ` (Optionen: ${opts})`;
+                } else if (type === 'text' || type === 'textarea' || type === 'number') {
+                    extraInfo = ` (Bitte passenden Text eintragen)`;
+                }
+                
+                // Bevorzuge name+value Selector für Checkbox/Radio, ansonsten name, ansonsten ID
+                let selector = '';
+                if ((type === 'radio' || type === 'checkbox') && name && val) {
+                    selector = `input[name='${name}'][value='${val}']`;
+                } else if (name) {
+                    selector = `${input.tagName.toLowerCase()}[name='${name}']`;
+                } else if (id) {
+                    selector = `#${id}`;
+                } else {
+                    return; // Skip if we have no reliable way to select it
+                }
+                
+                result += `\n- [${type}] TEXT: "${labelText}"${extraInfo} ---> SELECTOR: "${selector}"`;
+            });
+            return result;
         });
+
+        const inputCount = await newPage.evaluate(() => document.querySelectorAll('input[type="radio"], input[type="checkbox"], input[type="text"], input[type="number"], textarea, select').length);
+        console.log(`Gefundene Formularfelder auf der Seite: ${inputCount}`);
+        
+        if (inputCount === 0) {
+             console.log(`HINWEIS: Keine auswählbaren Fragen auf dieser Seite (Studie ${studyId}) gefunden.`);
+        }
 
         const apiKey = process.env.GEMINI_API_KEY;
         const userProfile = process.env.USER_PROFILE;
@@ -146,47 +209,87 @@ function saveProcessedStudy(id) {
 Du bist ein erfahrener Assistent, der Webformulare für Marktforschungsstudien ausfüllt, um die Qualifikationschancen des Nutzers zu maximieren.
 Hier ist das Basis-Profil des Nutzers:
 """
-\${userProfile}
+${userProfile}
 """
 
-Hier ist das HTML des Formulars (Zusatzfragen für eine Marktforschungsstudie):
+Hier ist eine extrahierte Liste aller Checkboxen und Radio-Buttons auf der aktuellen Seite:
 """
-\${formHtml}
+${simplifiedForm}
 """
 
 Aufgabe:
-Analysiere die Fragen im HTML (Checkboxen, Radio-Buttons). 
-Dein Ziel ist es, die Antworten auszuwählen, die die ALLERBESTEN CHANCEN bieten, für die Studie ausgewählt zu werden. 
-Das bedeutet: Wähle Antworten, die zur vermuteten Zielgruppe der Studie passen (z.B. hohes Interesse an bestimmten Themen, Kaufabsicht, Nutzung von vielen Produkten). Du darfst das Basis-Profil erweitern oder davon abweichen, wenn es die Chancen erhöht, aber die Antworten müssen in sich logisch und realistisch bleiben!
-Finde die exakten CSS-Selektoren (z.B. "#id" oder "input[name='xyz'][value='123']") für alle diese optimalen Optionen.
-Vergiss nicht, auch die Datenschutz-Checkbox ("Ich bin damit einverstanden...") in die Liste aufzunehmen, da diese Pflicht ist.
+Dein Ziel ist es, aus der Liste oben die Optionen auszuwählen oder Texte einzutragen, die die ALLERBESTEN CHANCEN bieten, für die Studie ausgewählt zu werden. Du darfst das Basis-Profil erweitern, wenn es die Chancen erhöht, aber bleibe realistisch!
 
-Gib ein striktes JSON-Objekt mit einem einzigen Key "selectors" zurück, der ein Array von Strings (die CSS-Selektoren) enthält.
-Beispiel: { "selectors": ["#checkbox1", "input[name='q1'][value='yes']"] }
+PFLICHT: Du MUSST ZWINGEND die Datenschutz- bzw. Einverständnis-Checkbox ankreuzen (meist Text wie "Ich bin einverstanden", "Datenschutz", "Teilnahmebedingungen"). Wenn du diese vergisst, ist die Bewerbung ungültig!
+
+Für jede Frage, die du beantworten willst, gibst du eine Aktion an.
+- Bei Checkboxen/Radios: Nutze action "click".
+- Bei Textfeldern/Textareas: Nutze action "type" und gib den passenden Text als "value" an.
+- Bei Dropdowns (select): Nutze action "select" und gib den exakten Options-Text als "value" an.
+
+Erfinde KEINE eigenen Selektoren! Nutze AUSSCHLIESSLICH die Strings hinter "SELECTOR:" aus der Liste oben!
+
+Gib ein striktes JSON-Objekt mit einem Array "actions" zurück.
+Beispiel: {
+  "actions": [
+    { "selector": "#privacy", "action": "click" },
+    { "selector": "textarea[name='children_ages']", "action": "type", "value": "Ich habe keine Kinder im Haushalt." },
+    { "selector": "select[name='income']", "action": "select", "value": "2000 - 3000 Euro" }
+  ]
+}
 `;
 
             try {
-                const response = await ai.models.generateContent({
-                    model: 'gemini-2.5-flash',
+                const result = await ai.models.generateContent({
+                    model: 'gemini-2.5-pro',
                     contents: prompt,
-                    config: {
-                        responseMimeType: "application/json",
-                    }
                 });
-
-                const responseText = response.text;
-                const result = JSON.parse(responseText);
-                const selectors = result.selectors || [];
                 
-                console.log(`Die KI empfiehlt folgende Klicks für Studie ${studyId}:`, selectors);
+                let text = result.text;
+                // Extrahiere JSON, falls Gemini es in Markdown-Codeblöcke packt
+                const jsonMatch = text.match(/```json\n([\s\S]*?)\n```/);
+                if (jsonMatch) {
+                    text = jsonMatch[1];
+                }
+                
+                const responseData = JSON.parse(text);
+                const actions = responseData.actions || [];
 
-                for (const selector of selectors) {
-                    console.log(`Klicke auf: ${selector}`);
-                    await newPage.click(selector, { force: true }).catch(e => console.log(`Konnte ${selector} nicht klicken.`));
-                    await newPage.waitForTimeout(500); // kleine Pause zwischen Klicks, damit es menschlicher wirkt
+                console.log(`Die KI empfiehlt folgende Aktionen für Studie ${studyId}:`, actions);
+
+                for (const task of actions) {
+                    const selector = task.selector;
+                    console.log(`Versuche Aktion '${task.action}' auf: ${selector}`);
+                    try {
+                        if (task.action === 'click') {
+                            // 1. Versuch: Playwright Force Click (gut für Frameworks wie React/Vue)
+                            try {
+                                await newPage.locator(selector).click({ force: true, timeout: 1500 });
+                            } catch (e1) {
+                                try {
+                                    // 2. Versuch: Natives JS Click auf das Element
+                                    await newPage.$eval(selector, el => el.click());
+                                } catch (e2) {
+                                    // 3. Versuch: Klick auf das zugehörige Label
+                                    await newPage.$eval(selector, el => {
+                                        if (el.labels && el.labels.length > 0) el.labels[0].click();
+                                        else if (el.closest('label')) el.closest('label').click();
+                                        else el.parentElement.click();
+                                    });
+                                }
+                            }
+                        } else if (task.action === 'type') {
+                            await newPage.fill(selector, task.value || '', { timeout: 1500 });
+                        } else if (task.action === 'select') {
+                            await newPage.selectOption(selector, { label: task.value }, { timeout: 1500 });
+                        }
+                    } catch (err) {
+                        console.log(`Fehler bei Ausführung von '${task.action}' auf '${selector}'`);
+                    }
+                    await newPage.waitForTimeout(300); // menschliche Pause
                 }
 
-                console.log(`Klicks ausgeführt! Formular für Studie ${studyId} ist bereit zum Absenden.`);
+                console.log(`Aktionen ausgeführt! Formular für Studie ${studyId} ist bereit zum Absenden.`);
                 
                 // Formular absenden ist manuell
                 // await newPage.click('input[value="Bewerben"]');
