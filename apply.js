@@ -1,6 +1,29 @@
 const { chromium } = require('playwright');
-const OpenAI = require('openai');
+const { GoogleGenAI } = require('@google/genai');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
+
+const PROCESSED_FILE = path.join(__dirname, 'processed_studies.json');
+
+function getProcessedStudies() {
+    if (fs.existsSync(PROCESSED_FILE)) {
+        try {
+            return JSON.parse(fs.readFileSync(PROCESSED_FILE, 'utf8'));
+        } catch (e) {
+            return [];
+        }
+    }
+    return [];
+}
+
+function saveProcessedStudy(id) {
+    const studies = getProcessedStudies();
+    if (!studies.includes(id)) {
+        studies.push(id);
+        fs.writeFileSync(PROCESSED_FILE, JSON.stringify(studies, null, 2));
+    }
+}
 
 (async () => {
   console.log('Starte MaFo Bewerber...');
@@ -29,9 +52,6 @@ require('dotenv').config();
       console.log('Bitte fülle die .env Datei aus.');
     } else {
       console.log('Versuche Login...');
-      // Try to find the username and password fields. 
-      // Typically these are inputs with type="text"/"email" and type="password".
-      // We are guessing the selectors here. Adjust after first run.
       const usernameInput = await page.$('input[type="text"], input[type="email"], input[name*="user"], input[name*="email"]');
       const passwordInput = await page.$('input[type="password"]');
 
@@ -39,7 +59,6 @@ require('dotenv').config();
         await usernameInput.fill(username);
         await passwordInput.fill(password);
         
-        // Find and click the login button
         const submitButton = await page.$('input[type="submit"], button[type="submit"]');
         if (submitButton) {
           await submitButton.click();
@@ -61,54 +80,85 @@ require('dotenv').config();
     console.log('Suche nach verfügbaren Studien...');
     const accordions = await page.$$('.accordion-toggle');
     console.log(`Gefundene Studien (Akkordeons): ${accordions.length}`);
+    
+    console.log('Öffne alle Akkordeons, um Formulare sichtbar zu machen...');
+    for (const acc of accordions) {
+        await acc.click().catch(() => {});
+        await page.waitForTimeout(200); // short wait for animation
+    }
 
-    if (accordions.length > 0) {
-        console.log('Öffne die erste Studie im Akkordeon...');
-        await accordions[0].click();
-        
-        // Wait for the Bewerben button to become visible
-        const bewerbenButton = page.locator('input[value="Bewerben"]').first();
-        await bewerbenButton.waitFor({ state: 'visible' });
+    // Evaluate all forms and their action targets
+    const studyLinks = await page.evaluate(() => {
+        const links = [];
+        document.querySelectorAll('form').forEach(f => {
+            const btn = f.querySelector('input[value="Bewerben"], button[type="submit"]');
+            if (btn && f.getAttribute('action')) {
+                // Ensure it's a study link
+                if (f.getAttribute('action').includes('einzelne_Studie')) {
+                    links.push(f.getAttribute('action'));
+                }
+            }
+        });
+        return Array.from(new Set(links)); // Unique links only
+    });
 
-        console.log('Dry-Run: Klicke auf den Bewerben-Button der ersten Studie...');
-        await bewerbenButton.click();
-        await page.waitForLoadState('networkidle');
+    console.log(`Gefundene Studien-Links: ${studyLinks.length}`);
+    const processedStudies = getProcessedStudies();
+
+    for (const link of studyLinks) {
+        const studyIdMatch = link.match(/\?(\d+)/);
+        const studyId = studyIdMatch ? studyIdMatch[1] : link;
+
+        if (processedStudies.includes(studyId)) {
+            console.log(`Studie ${studyId} wurde bereits bearbeitet. Überspringe...`);
+            continue;
+        }
+
+        console.log(`\n============================`);
+        console.log(`Öffne Studie ${studyId} in neuem Tab...`);
         
-        console.log('Aktuelle URL nach Klick auf Bewerben:', page.url());
-        
+        const studyUrl = link.startsWith('http') 
+            ? link 
+            : 'https://www.mafo-service-schmidt.de/' + (link.startsWith('/') ? link.substring(1) : link);
+            
+        const newPage = await context.newPage();
+        await newPage.goto(studyUrl);
+        await newPage.waitForLoadState('networkidle');
+
         console.log('Extrahiere Formular-Fragen für die KI...');
-        const formHtml = await page.evaluate(() => {
+        const formHtml = await newPage.evaluate(() => {
             const form = document.querySelector('form') || document.body;
             const clone = form.cloneNode(true);
             clone.querySelectorAll('script, style, input[type="hidden"], svg').forEach(el => el.remove());
             return clone.innerHTML;
         });
 
-        const apiKey = process.env.OPENAI_API_KEY;
+        const apiKey = process.env.GEMINI_API_KEY;
         const userProfile = process.env.USER_PROFILE;
 
         if (!apiKey || apiKey.includes('dein_openai_api_key') || !userProfile) {
-            console.log('KI-Antworten übersprungen: OPENAI_API_KEY oder USER_PROFILE fehlen in der .env oder sind Standardwerte.');
-            await page.pause();
+            console.log('KI-Antworten übersprungen: GEMINI_API_KEY oder USER_PROFILE fehlen in der .env oder sind Standardwerte.');
         } else {
             console.log('Frage KI nach den richtigen Antworten (dies dauert einen Moment)...');
-            const openai = new OpenAI({ apiKey });
+            const ai = new GoogleGenAI({ apiKey });
             
             const prompt = `
-Du bist ein Assistent, der Webformulare ausfüllt.
-Hier ist das Profil des Nutzers:
+Du bist ein erfahrener Assistent, der Webformulare für Marktforschungsstudien ausfüllt, um die Qualifikationschancen des Nutzers zu maximieren.
+Hier ist das Basis-Profil des Nutzers:
 """
-${userProfile}
+\${userProfile}
 """
 
 Hier ist das HTML des Formulars (Zusatzfragen für eine Marktforschungsstudie):
 """
-${formHtml}
+\${formHtml}
 """
 
 Aufgabe:
-Analysiere die Fragen im HTML (Checkboxen, Radio-Buttons) und vergleiche sie mit dem Nutzerprofil.
-Finde die exakten CSS-Selektoren (z.B. "#id" oder "input[name='xyz'][value='123']") für alle Optionen, die angeklickt werden müssen, damit das Formular wahrheitsgemäß beantwortet wird.
+Analysiere die Fragen im HTML (Checkboxen, Radio-Buttons). 
+Dein Ziel ist es, die Antworten auszuwählen, die die ALLERBESTEN CHANCEN bieten, für die Studie ausgewählt zu werden. 
+Das bedeutet: Wähle Antworten, die zur vermuteten Zielgruppe der Studie passen (z.B. hohes Interesse an bestimmten Themen, Kaufabsicht, Nutzung von vielen Produkten). Du darfst das Basis-Profil erweitern oder davon abweichen, wenn es die Chancen erhöht, aber die Antworten müssen in sich logisch und realistisch bleiben!
+Finde die exakten CSS-Selektoren (z.B. "#id" oder "input[name='xyz'][value='123']") für alle diese optimalen Optionen.
 Vergiss nicht, auch die Datenschutz-Checkbox ("Ich bin damit einverstanden...") in die Liste aufzunehmen, da diese Pflicht ist.
 
 Gib ein striktes JSON-Objekt mit einem einzigen Key "selectors" zurück, der ein Array von Strings (die CSS-Selektoren) enthält.
@@ -116,48 +166,53 @@ Beispiel: { "selectors": ["#checkbox1", "input[name='q1'][value='yes']"] }
 `;
 
             try {
-                const completion = await openai.chat.completions.create({
-                    messages: [{ role: "user", content: prompt }],
-                    model: "gpt-4o",
-                    response_format: { type: "json_object" }
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: prompt,
+                    config: {
+                        responseMimeType: "application/json",
+                    }
                 });
 
-                const responseText = completion.choices[0].message.content;
+                const responseText = response.text;
                 const result = JSON.parse(responseText);
                 const selectors = result.selectors || [];
                 
-                console.log('Die KI empfiehlt folgende Klicks:', selectors);
+                console.log(`Die KI empfiehlt folgende Klicks für Studie ${studyId}:`, selectors);
 
                 for (const selector of selectors) {
                     console.log(`Klicke auf: ${selector}`);
-                    await page.click(selector, { force: true });
-                    await page.waitForTimeout(500); // kleine Pause zwischen Klicks, damit es menschlicher wirkt
+                    await newPage.click(selector, { force: true }).catch(e => console.log(`Konnte ${selector} nicht klicken.`));
+                    await newPage.waitForTimeout(500); // kleine Pause zwischen Klicks, damit es menschlicher wirkt
                 }
 
-                console.log('Klicks ausgeführt! Formular ist bereit zum Absenden.');
+                console.log(`Klicks ausgeführt! Formular für Studie ${studyId} ist bereit zum Absenden.`);
                 
-                const finalSubmit = await page.$('input[type="submit"][value="Bewerben"], button:has-text("Bewerben")');
-                if (finalSubmit) {
-                    console.log('Sende Formular final ab... (Der finale Klick ist noch auskommentiert für deinen Test)');
-                    // await finalSubmit.click(); 
-                    // await page.waitForLoadState('networkidle');
-                    // console.log('Bewerbung erfolgreich abgeschickt!');
-                }
+                // Formular absenden ist manuell
+                // await newPage.click('input[value="Bewerben"]');
 
-                console.log('Pausiere zur manuellen Kontrolle. Du kannst dir das Ergebnis im Browser ansehen.');
-                await page.pause();
+                // Mark as processed
+                saveProcessedStudy(studyId);
+                console.log(`Studie ${studyId} als bearbeitet markiert.`);
 
             } catch (err) {
-                console.error('Fehler bei der KI-Anfrage oder beim Klicken:', err);
-                await page.pause();
+                console.error(`Fehler bei der KI-Anfrage oder beim Klicken in Studie ${studyId}:`, err);
             }
         }
     }
+    
+    console.log('\n============================');
+    console.log('Alle Studien wurden überprüft und vorbereitet!');
+    console.log('Der Browser bleibt jetzt offen, damit du dir alle Tabs in Ruhe ansehen und die Formulare manuell absenden kannst.');
+    console.log('Wenn du fertig bist, kannst du das Browserfenster schließen oder das Skript im Terminal mit Ctrl+C beenden.');
+    
+    // Keep the script running forever so tabs don't close
+    await new Promise(() => {});
 
   } catch (error) {
     console.error('Ein Fehler ist aufgetreten:', error);
   } finally {
+    // We never reach here automatically anymore due to the Promise trap
     // await browser.close();
-    console.log('Skript beendet. (Browser bleibt fürs Debugging offen, manuell schließen)');
   }
 })();
