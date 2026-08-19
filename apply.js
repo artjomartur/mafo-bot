@@ -104,6 +104,20 @@ function saveProcessedStudy(id) {
 
     console.log(`Gefundene Studien-Formulare: ${studyForms.length}`);
     const processedStudies = getProcessedStudies();
+    
+    console.log(`\n--- DEBUG INFO ---`);
+    console.log(`Studien im Gedächtnis (${processedStudies.length}):`, processedStudies.join(', '));
+    
+    const toOpen = [];
+    for (const { action } of studyForms) {
+        const studyIdMatch = action.match(/\?(\d+)/);
+        const studyId = studyIdMatch ? studyIdMatch[1] : action;
+        if (!processedStudies.includes(studyId)) {
+            toOpen.push(studyId);
+        }
+    }
+    console.log(`Studien, die neu geöffnet werden (${toOpen.length}):`, toOpen.join(', '));
+    console.log(`------------------\n`);
 
     for (const { form, btn, action } of studyForms) {
         const studyIdMatch = action.match(/\?(\d+)/);
